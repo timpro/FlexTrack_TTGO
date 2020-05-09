@@ -22,31 +22,19 @@ s|                                                                              
 
 // LORA settings
 #define LORA_PAYLOAD_ID   "TTGO"            // Do not use spaces.
-#define LORA_SLOT            -1
-#define LORA_REPEAT_SLOT_1   -1
-#define LORA_REPEAT_SLOT_2   -1
-
-#define LORA_RTTY_FREQ    434.400               // For devices that are frequency-agile
-#define LORA_RTTY_BAUD       300
-#define LORA_RTTY_SHIFT      488
-#define LORA_RTTY_COUNT       0           // n RTTY packets.  Set to 0 to disable
-#define LORA_RTTY_EVERY       3           // After every n LoRa packets
-#define LORA_RTTY_PREAMBLE    8
-
-#define LORA_TIME_INDEX      2
-#define LORA_TIME_MUTLIPLER  2
-#define LORA_TIME_OFFSET     1
-#define LORA_PACKET_TIME    500
-#define LORA_FREQUENCY       434.450
+#define LORA_FREQUENCY      869.5
 #define LORA_OFFSET           0         // Frequency to add in kHz to make Tx frequency accurate
 
+#define POWERLEVEL	(0x80 - 2 + 7)  //  7dBm =  5mW for 868MHz
+//#define POWERLEVEL	(0x80 - 2 + 10) // 10dBm = 10mW for 434MHz
+
 #define LORA_ID              0
-#define LORA_CYCLETIME       0                // Set to zero to send continuously
 #define LORA_MODE            2
 #define LORA_BINARY          0
-#define LORA_CALL_FREQ 		433.650
-#define LORA_CALL_MODE		 5				
-#define LORA_CALL_COUNT		 10				// Set to zero to disable calling mode
+
+#define HORUS_4FSK_ID         0	        // Request a personal ID from Project Horus
+#define LORA_FSK_FREQ       869.5
+#define LORA_FSK_SHIFT        3
 
 
 // Cutdown settings
@@ -59,6 +47,7 @@ s|                                                                              
 
 // HARDWARE DEFINITION
 
+// TTGO battery Voltage may be on pin 35, or that could be used for LoRa pin DIO1
 #define LORA_NSS           18                // Comment out to disable LoRa code
 #define LORA_RESET         14                // Comment out if not connected
 #define LORA_DIO0          26                
@@ -73,8 +62,8 @@ s|                                                                              
   #define DEBUG_SERIAL Serial
 #endif
 
-#define EXTRA_FIELD_FORMAT    ",%d,%d,%d"          // List of formats for extra fields. Make empty if no such fields.  Always use comma at start of there are any such fields.
-#define EXTRA_FIELD_LIST           ,(int)((GPS.Speed * 13) / 7), GPS.Direction, GPS.Satellites
+#define EXTRA_FIELD_FORMAT    ",%d,%d,%d,%0.2f"          // ",speed ,sats ,temp ,volts"  Always use comma at start if there are any such fields.
+#define EXTRA_FIELD_LIST           ,(int)((GPS.Speed * 9) / 2500), GPS.Satellites, GPS.InternalTemperature, GPS.BatteryVoltage
 
 // #define EXTRA_FIELD_FORMAT      ",%d,%d,%d,%d,%d,%d"          // List of formats for extra fields. Make empty if no such fields.  Always use comma at start of there are any such fields.
 // #define EXTRA_FIELD_LIST            ,(int)((GPS.Speed * 13) / 7), GPS.Direction, GPS.Satellites, DS18B20_Temperatures[0], Channel0Average, GPS.CutdownStatus
@@ -122,9 +111,9 @@ struct TGPS
   int Direction;
   byte FixType;
   byte psm_status;
-  float InternalTemperature;
+  int InternalTemperature;
   float BatteryVoltage;
-  float ExternalTemperature;
+  int ExternalTemperature;
   float Pressure;
   unsigned int BoardCurrent;
   unsigned int errorstatus;
@@ -224,4 +213,5 @@ void loop()
 #ifdef WIREBUS
   Checkds18b20();
 #endif
+  delay(10);  // Would normally sleep here
 }

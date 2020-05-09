@@ -114,6 +114,9 @@ void SetupGPS(void)
   Serial.println("Open GPS port");
   Serial1.begin(9600, SERIAL_8N1, 34, 12); // Pins for T-Beam v0.8 (3 push buttons) and up
   // Serial1.begin(9600, SERIAL_8N1, 12, 15); // For version 0.7 (2 push buttons) and down
+
+  GPS.InternalTemperature = 0;
+  GPS.BatteryVoltage = 3.3f;
 }
 
 int GPSChecksumOK(char *Buffer, int Count)
