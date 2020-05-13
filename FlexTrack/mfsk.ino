@@ -3,93 +3,162 @@
 // enjoy and have a nice day
 // ver 1.5a
 
-
-
-// Note that the Golay Code is incompatible with the GPL License :
-// * COPYRIGHT NOTICE: This computer program is free for non-commercial purposes.
-
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
+#include "H128_384.h"
+
+void LoraFSKshift(int8_t shift); // bitbang carrier frequency
+void interleave(unsigned char *inout, int nbytes);
+void scramble(unsigned char *inout, int nbytes);
+int ldpc_encode_tx_packet(unsigned char *out, unsigned char *in);
+
+
 volatile char tx_on = 0;
-char tx_on_delay = 10;
-char tx_off_delay = 10;
-char tx_enable = 1;
-char current_mfsk_byte = 0;
-char txbuff[50]; // 22 bytes * 23/12 + 2 + 4 = 50
+volatile char tx_enable = 1;
+char tx_on_delay = 4;
+char tx_off_delay = 4;
+uint8_t current_mfsk_byte = 0;
+char txbuff[60]; // 16 bytes + 32 parity + 4 preamble  = 52
 int packet_length = 0;
 
-/* Horus binary packet */
+/* Short binary packet */
+// 4 byte preamble for high error rates ("ESC,ESC,$,$")
+// All data 8 bit Gray coded when calculating Checksum
+//	- to improve soft bit prediction
 struct __attribute__ ((packed)) FBinaryPacket 
 {
-uint8_t   PayloadID;
-uint16_t  Counter;
-uint8_t   Hours;
-uint8_t   Minutes;
-uint8_t   Seconds;
-float   Latitude;
-float   Longitude;
-uint16_t  Altitude;
-uint8_t   Speed; // Speed in Knots (1-255 knots)
-uint8_t   Sats;
-int8_t    Temp; // -64 to +64; SI4032 internal chip temp.
-uint8_t   BattVoltage; // 0 = 0v, 255 = 5.0V, linear steps in-between.
-uint16_t  Checksum; // CRC16-CCITT Checksum.
-};
-FBinaryPacket FSK;
+uint8_t   PayloadID;	// Legacy list
+uint8_t   Counter;	// 8 bit counter
+uint16_t  Biseconds;	// Time of day / 2
+uint8_t   Latitude[3];	// (int)(float * 1.0e7) / (1<<8)
+uint8_t   Longitude[3];	// ( better than 10m precision )
+uint16_t  Altitude;	// 0 - 65 km
+uint8_t   Voltage;	// scaled 5.0v in 255 range
+uint8_t   User;		// Temp / Sats
+	// Temperature	6 bits MSB => (+30 to -32)
+	// Satellites	2 bits LSB => 0,4,8,12 is good enough
+uint16_t  Checksum;	// CRC16-CCITT Checksum.
+} FSK;	// 16 data bytes, for (128,384) LDPC FEC
+	// => 52 bytes at 100Hz 4fsk => 2 seconds
 
 void start_sending() {
 //	radio_enable_tx(); // carrier on
-	tx_on_delay = 10;  // preamble before packet
+	tx_on_delay = 4;  // preamble before packet
 	tx_on = 1;	   // enable timer interrupt TX
 	tx_enable = 0;	   // lock radio for main thread
 }
 
 void stop_sending() {
 	current_mfsk_byte = 0;  // reset next sentence to start
-	tx_off_delay = 10;      // postamble before next action
+	tx_off_delay = 4;      // postamble before next action
 	tx_on = 0;		// disable timer interrupt TX
 //	radio_disable_tx();	// carrier off
 }
 
-void fill_FSK() {
-  FSK.PayloadID = HORUS_4FSK_ID;
-  FSK.Hours = GPS.Hours;
-  FSK.Minutes = GPS.Minutes;
-  FSK.Seconds = GPS.Seconds;
-  FSK.Longitude = GPS.Longitude;
-  FSK.Latitude = GPS.Latitude;
-  FSK.Altitude = (uint16_t)GPS.Altitude;
-  if (GPS.Altitude < 0)
-    FSK.Altitude = 0; // unsigned altitude
-  FSK.Sats = GPS.Satellites;
-  FSK.Speed = (uint8_t)(9 * GPS.Speed / 2500); // Knots?
-  FSK.Temp = (int8_t)GPS.InternalTemperature;
-  FSK.BattVoltage = (uint8_t)(255.0 * GPS.BatteryVoltage / 5.0); // Fails if Volts > 5.0
+// pack position +/- 180.xx into 24 bits
+// using Ublox 32bit binary format, truncated
+int32_t float_int32(float pos) {
+	return (int32_t)(pos * 1.0e7f);
 }
 
-int get_mfsk(char _char); // extract 2 bits from TX string
-void LoraFSKshift(byte shift); // bitbang carrier frequency
+void fill_FSK() {
+	int32_t position, user, sats, temp, volts;
+  // static uint8_t count = 0;
+
+	FSK.PayloadID = HORUS_4FSK_ID;
+  FSK.Counter=SentenceCounter;
+	FSK.Biseconds = 30 * 60 * GPS.Hours
+			+ 30 * GPS.Minutes
+			+ GPS.Seconds >> 1;
+
+	position = float_int32(GPS.Longitude);
+	FSK.Longitude[0] = 0xFF & (position >> 8);
+	FSK.Longitude[1] = 0xFF & (position >>16);
+	FSK.Longitude[2] = 0xFF & (position >>24);
+	position = float_int32(GPS.Latitude);
+	FSK.Latitude[0] = 0xFF & (position >> 8);
+	FSK.Latitude[1] = 0xFF & (position >>16);
+	FSK.Latitude[2] = 0xFF & (position >>24);
+	if (GPS.Altitude > 0)
+		FSK.Altitude = (uint16_t)GPS.Altitude;
+	else
+		FSK.Altitude = 0; // unsigned altitude
+
+	// 1.5v to 3.5v, for RS41, 5.0V => 255
+	volts = (uint16_t)(GPS.BatteryVoltage * 51.0f);
+	if (volts > 255) volts = 255;
+	FSK.Voltage = (uint8_t)volts;
+	// 4 bits offset 5
+
+	// Six bit temperature, +31C to -32C in 1C steps
+	temp = (int16_t)GPS.InternalTemperature;
+	if (temp > 31) temp = 31;
+	if (temp < -32) temp = -32;
+	user = (uint8_t)(temp << 2);
+	// 6 bits offset 2
+
+	// rough guide to GPS quality, (0,4,8,12 sats)
+	sats = GPS.Satellites >> 2;
+	if (sats < 0) sats = 0;
+	if (sats > 3) sats = 3;
+	user |= sats;
+	// 2 bits offset 0
+
+	FSK.User = user;
+}
+
+#if 1
+int8_t get_4fsk(char c_in) {
+	static uint8_t nr_bit = 0;
+	int8_t _c;
+
+	if (nr_bit > 7){
+		nr_bit = 0;
+		return -1; // request next input char
+	} else {
+		// Shift the bits we want into the MSB.
+		_c = c_in << nr_bit;
+		nr_bit += 2;
+		return 3 & (_c >> 6); // MSB as LSB
+	}
+}
+#else
+int8_t get_2fsk(char c_in) {
+	// Step through a byte, and return 2FSK symbols.
+	static uint8_t nr_bit = 0;
+	int8_t _c;
+
+	if (nr_bit > 7){
+		nr_bit = 0;
+		return -1; // request next input char
+	} else {
+		// Shift the bit we want into the MSB.
+		_c = c_in << nr_bit++;
+		return 1 & (_c >> 7); // MSB as LSB
+	}
+}
+#endif
 
 // Symbol Timing Interrupt
 void TIM2_IRQHandler(void) {
-	static int mfsk_symbol = 0;
+	static int8_t mfsk_symbol = 0;
 		if ( tx_on ) {
 			if ( !tx_on_delay ) {
-				// 4FSK Symbol Selection Logic
-				mfsk_symbol = get_mfsk(txbuff[current_mfsk_byte]);
+				mfsk_symbol = get_4fsk(txbuff[current_mfsk_byte]);
 
 				if ( mfsk_symbol == -1 ) {
+					mfsk_symbol = 0;
 					// Reached the end of the current character, increment the current-byte pointer.
 					if ( current_mfsk_byte++ >= packet_length ) {
 						stop_sending();
 					} else {
 						// We've now advanced to the next byte, grab the first symbol from it.
-						mfsk_symbol = get_mfsk(txbuff[current_mfsk_byte]);
+						mfsk_symbol = get_4fsk(txbuff[current_mfsk_byte]);
 					}
 				}
-				LoraFSKshift(mfsk_symbol & 0x03);
+				LoraFSKshift(mfsk_symbol);
 			} else {
 				// Preamble for horus_demod to lock on:
 				mfsk_symbol = (mfsk_symbol + 1) & 0x03;
@@ -101,7 +170,7 @@ void TIM2_IRQHandler(void) {
 			if ( tx_off_delay ) {
 				tx_off_delay--;
 				// Postamble for horus_demod to lock on:
-				mfsk_symbol = (mfsk_symbol + 1) & 0x03;
+				mfsk_symbol = (mfsk_symbol - 1) & 0x03;
 				LoraFSKshift(mfsk_symbol);
 			} else if ( !tx_enable )
 				tx_enable = 1;
@@ -148,52 +217,38 @@ uint16_t array_CRC16_checksum(char *string, int len) {
   return crc;
 }
 
-int horus_l2_encode_tx_packet(unsigned char *out, unsigned char *in, int num);
-void send_mfsk_packet() {
-	fill_FSK();
-	FSK.Checksum = (uint16_t)array_CRC16_checksum( (char*)&FSK,sizeof(FBinaryPacket) - 2);
-
-	memset(txbuff, 0x1b, 4);  // preamble, 32bits (unnecessary)
-	int coded_len = horus_l2_encode_tx_packet( (uint8_t*)txbuff + 4, (uint8_t*)&FSK, sizeof(FBinaryPacket) );
-
-	packet_length = coded_len + 4; // packet + preamble
-	start_sending();
+void arrayToGray(uint8_t *loc, uint8_t len)
+{
+	uint8_t i, n;
+	uint8_t *ptr = loc;
+	for (i = 0; i < len; i++) {
+		n = *ptr;
+		*ptr++ = n ^ (n>>1);
+	}
 }
 
-int get_mfsk(char current_char) {
-	// Step through a byte, and return 4FSK symbols.
-	static uint8_t nr_nibble = 0;
-	char _c = current_char;
-
-	if (nr_nibble == 4){
-		// Reached the end of the byte.
-		nr_nibble = 0;
-		// Return -1 to indicate we have finished with this byte.
-		return -1;
-	} else {
-		// Shift it left to the nibble we are up to.
-		for (int _i=0;_i<nr_nibble;_i++){
-			_c = _c << 2;
-		}
-		// Get the current symbol (the 2-bits we need).
-		uint8_t symbol = ((uint8_t)_c & 0xC0) >> 6;
-
-		nr_nibble++;
-		return (int)symbol;
-	}
+void send_mfsk_packet() {
+	fill_FSK();
+	arrayToGray((uint8_t*)&FSK, sizeof(FSK) - 2);
+	FSK.Checksum = (uint16_t)array_CRC16_checksum((char*)&FSK, sizeof(FSK) - 2);
+	// Serial.println("Encoding 4fsk packet");
+	packet_length = ldpc_encode_tx_packet((uint8_t*)txbuff, (uint8_t*)&FSK);
+	// Serial.println("Sending 4fsk packet");
+	start_sending();
 }
 
 
 /*---------------------------------------------------------------------------*\
+
+  Adapted from Horus 4fsk code in RS41HUP, licenced as GPL2:
 
   FILE........: horus_l2.c
   AUTHOR......: David Rowe
   DATE CREATED: Dec 2015
 
   Horus telemetry layer 2 processing.  Takes an array of 8 bit payload
-  data, generates parity bits for a (23,12) Golay code, interleaves
-  data and parity bits, pre-pends a Unique Word for modem sync.
-  Caller is responsible for providing storage for output packet.
+  data, generates parity bits for error correction, interleaves
+  data and parity bits, scrambles and prepends a Unique Word.
 
 \*---------------------------------------------------------------------------*/
 
@@ -203,211 +258,68 @@ int get_mfsk(char current_char) {
 #include <string.h>
 #include <stdint.h>
 
-#define RUN_TIME_TABLES
 #define INTERLEAVER
 #define SCRAMBLER
+#define CODEBYTES (DATABYTES + PARITYBYTES)
+//  Take payload data bytes, prepend a unique word and append parity bits
+int ldpc_encode_tx_packet(unsigned char *out_data, unsigned char *in_data) {
+    unsigned int   i, last = 0;
+    unsigned char *pout;
+    const char uw[] = { 0x1b, 0x1b,'$','$' };
 
-static char uw[] = {'$','$'};
+    pout = out_data;
+    memcpy(pout, uw, sizeof(uw));
+    pout += sizeof(uw);
+    memcpy(pout, in_data, DATABYTES);
+    pout += DATABYTES;
+    memset(pout, 0, PARITYBYTES);
 
-/* Function Prototypes ------------------------------------------------*/
+    // process parity bit offsets
+    for (i = 0; i < NUMBERPARITYBITS; i++) {
+        unsigned int shift, j;
 
-int32_t get_syndrome(int32_t pattern);
-unsigned short gen_crc16(unsigned char* data_p, unsigned char length);
-void interleave(unsigned char *inout, int nbytes, int dir);
-void scramble(unsigned char *inout, int nbytes);
+	for(j = 0; j < ROWDEPTH; j++) {
+		uint8_t tmp  = H_rows[i + j * NUMBERPARITYBITS] - 1;
+		shift = 7 - (tmp & 7); // MSB
+		last ^= in_data[tmp >> 3] >> shift;
+	}
+	shift = 7 - (i & 7); // MSB
+	pout[i >> 3] |= (last & 1) << shift;
+    }
 
-/* Functions ----------------------------------------------------------*/
+    pout = out_data + sizeof(uw);
+    interleave(pout, CODEBYTES);
+    scramble(pout, CODEBYTES);
 
-/*
-   We are using a Golay (23,12) code which has a codeword 23 bits
-   long.  The tx packet format is:
-
-      | Unique Word | payload data bits | parity bits |
-
-   This function works out how much storage the caller of
-   horus_l2_encode_tx_packet() will need to store the tx packet
- */
-
-int horus_l2_get_num_tx_data_bytes(int num_payload_data_bytes) {
-    int num_payload_data_bits, num_golay_codewords;
-    int num_tx_data_bits, num_tx_data_bytes;
-    
-    num_payload_data_bits = num_payload_data_bytes*8;
-    num_golay_codewords = num_payload_data_bits/12;
-    if (num_payload_data_bits % 12) /* round up to 12 bits, may mean some unused bits */
-        num_golay_codewords++;
-
-    num_tx_data_bits = sizeof(uw)*8 + num_payload_data_bits + num_golay_codewords*11;
-    num_tx_data_bytes = num_tx_data_bits/8;
-    if (num_tx_data_bits % 8) /* round up to nearest byte, may mean some unused bits */
-        num_tx_data_bytes++;
-    
-    return num_tx_data_bytes;
+    return CODEBYTES + sizeof(uw);
 }
 
-
-/*
-  Takes an array of payload data bytes, prepends a unique word and appends
-  parity bits.
-
-  The encoder will run on the payload on a small 8-bit uC.  As we are
-  memory constrained so we do a lot of burrowing for bits out of
-  packed arrays, and don't use a LUT for Golay encoding.  Hopefully it
-  will run fast enough.  This was quite difficult to get going,
-  suspect there is a better way to write this.  Oh well, have to start
-  somewhere.
- */
-
-int horus_l2_encode_tx_packet(unsigned char *output_tx_data,
-                              unsigned char *input_payload_data,
-                              int            num_payload_data_bytes)
-{
-    int            num_tx_data_bytes, num_payload_data_bits;
-    unsigned char *pout = output_tx_data;
-    int            ninbit, ningolay, nparitybits;
-    int32_t        ingolay, paritybyte, inbit, golayparity;
-    int            ninbyte, shift, golayparitybit, i;
-
-    num_tx_data_bytes = horus_l2_get_num_tx_data_bytes(num_payload_data_bytes);
-    memcpy(pout, uw, sizeof(uw)); pout += sizeof(uw);
-    memcpy(pout, input_payload_data, num_payload_data_bytes); pout += num_payload_data_bytes;
-
-    /* Read input bits one at a time.  Fill input Golay codeword.  Find output Golay codeword.
-       Write this to parity bits.  Write parity bytes when we have 8 parity bits.  Bits are
-       written MSB first. */
-
-    num_payload_data_bits = num_payload_data_bytes*8;
-    ninbit = 0;
-    ingolay = 0;
-    ningolay = 0;
-    paritybyte = 0;
-    nparitybits = 0;
-
-    while (ninbit < num_payload_data_bits) {
-
-        /* extract input data bit */
-        ninbyte = ninbit/8;
-        shift = 7 - (ninbit % 8);
-        inbit = (input_payload_data[ninbyte] >> shift) & 0x1;
-        ninbit++;
-
-        /* build up input golay codeword */
-        ingolay = ingolay | inbit;
-        ningolay++;
-
-        /* when we get 12 bits do a Golay encode */
-        if (ningolay % 12) {
-            ingolay <<= 1;
-        }
-        else {
-            golayparity = get_syndrome(ingolay<<11);
-            ingolay = 0;
-
-            /* write parity bits to output data */
-            for (i=0; i<11; i++) {
-                golayparitybit = (golayparity >> (10-i)) & 0x1;
-                paritybyte = paritybyte | golayparitybit;
-                nparitybits++;
-                if (nparitybits % 8) {
-                   paritybyte <<= 1;
-                }
-                else {
-                    /* OK we have a full byte ready */
-                    *pout = paritybyte;
-                    pout++;
-                    paritybyte = 0;
-                }
-            }
-        }
-    } /* while(.... */
-
-
-    /* Complete final Golay encode, we may have partially finished ingolay, paritybyte */
-    if (ningolay % 12) {
-        ingolay >>= 1;
-        golayparity = get_syndrome(ingolay<<12);
-
-        /* write parity bits to output data */
-        for (i=0; i<11; i++) {
-            golayparitybit = (golayparity >> (10 - i)) & 0x1;
-            paritybyte = paritybyte | golayparitybit;
-            nparitybits++;
-            if (nparitybits % 8) {
-                paritybyte <<= 1;
-            }
-            else {
-                /* OK we have a full byte ready */
-                *pout++ = (unsigned char)paritybyte;
-                paritybyte = 0;
-            }
-        }
-    }
- 
-    /* and final, partially complete, parity byte */
-    if (nparitybits % 8) {
-        paritybyte <<= 7 - (nparitybits % 8);  // use MS bits first
-        *pout++ = (unsigned char)paritybyte;
-    }
-    assert(pout == (output_tx_data + num_tx_data_bytes));
-
-    /* optional interleaver - we dont interleave UW */
-    #ifdef INTERLEAVER
-    interleave(&output_tx_data[sizeof(uw)], num_tx_data_bytes-2, 0);
-    #endif
-
-    /* optional scrambler to prevent long strings of the same symbol
-       which upsets the modem - we dont scramble UW */
-
-    #ifdef SCRAMBLER
-    scramble(&output_tx_data[sizeof(uw)], num_tx_data_bytes-2);
-    #endif
-
-    return num_tx_data_bytes;
-}
-
-#ifdef INTERLEAVER
-void interleave(unsigned char *inout, int nbytes, int dir)
+// single directional for encoding
+void interleave(unsigned char *inout, int nbytes)
 {
     uint16_t nbits = (uint16_t)nbytes*8;
-    uint32_t i, j, n, ibit, ibyte, ishift, jbyte, jshift;
-    uint32_t b;
+    uint32_t i, j, ibit, ibyte, ishift, jbyte, jshift;
     unsigned char out[nbytes];
 
-
     memset(out, 0, nbytes);
-           
-    b = 337; // prime number chosen for THIS configuration
-
-    for(n=0; n<nbits; n++) {
+    for(i=0; i<nbits; i++) {
         /*  "On the Analysis and Design of Good Algebraic Interleavers", Xie et al,eq (5) */
-        i = n;
-        j = (b*i) % nbits;
+        j = (COPRIME * i) % nbits;
         
-        if (dir) {
-            uint16_t tmp = j;
-            j = i;
-            i = tmp;
-        }
-
-        /* read bit i and write to bit j postion */
-        ibyte = i/8;
-        ishift = i%8;
+        /* read bit i  */
+        ibyte = i>>3;
+        ishift = i&7;
         ibit = (inout[ibyte] >> ishift) & 0x1;
 
-        jbyte = j/8;
-        jshift = j%8;
-
-        /* write jbit to ibit position */
+	/* write bit i  to bit j position */ 
+        jbyte = j>>3;
+        jshift = j&7;
         out[jbyte] |= ibit << jshift; // replace with i-th bit
-        //out[ibyte] |= ibit << ishift; // replace with i-th bit
     }
  
     memcpy(inout, out, nbytes);
 }
-#endif
 
-
-#ifdef SCRAMBLER
 /* 16 bit DVB additive scrambler as per Wikpedia example */
 void scramble(unsigned char *inout, int nbytes)
 {
@@ -422,8 +334,8 @@ void scramble(unsigned char *inout, int nbytes)
         scrambler_out = ((scrambler & 0x2) >> 1) ^ (scrambler & 0x1);
 
         /* modify i-th bit by xor-ing with scrambler output sequence */
-        ibyte = i/8;
-        ishift = i%8;
+        ibyte = i>>3;
+        ishift = i&7;
         ibit = (inout[ibyte] >> ishift) & 0x1;
         ibits = ibit ^ scrambler_out;                  // xor ibit with scrambler output
 
@@ -435,103 +347,4 @@ void scramble(unsigned char *inout, int nbytes)
         scrambler >>= 1;
         scrambler |= scrambler_out << 14;
     }
-}
-#endif
-
-/*---------------------------------------------------------------------------*\
-
-                                   GOLAY FUNCTIONS
-
-\*---------------------------------------------------------------------------*/
-
-/* File:    golay23.c
- * Title:   Encoder/decoder for a binary (23,12,7) Golay code
- * Author:  Robert Morelos-Zaragoza (robert@spectra.eng.hawaii.edu)
- * Date:    August 1994
- *
- * The binary (23,12,7) Golay code is an example of a perfect code, that is,
- * the number of syndromes equals the number of correctable error patterns.
- * The minimum distance is 7, so all error patterns of Hamming weight up to
- * 3 can be corrected. The total number of these error patterns is:
- *
- *       Number of errors         Number of patterns
- *       ----------------         ------------------
- *              0                         1
- *              1                        23
- *              2                       253
- *              3                      1771
- *                                     ----
- *    Total number of error patterns = 2048 = 2^{11} = number of syndromes
- *                                               --
- *                number of redundant bits -------^
- *
- * Because of its relatively low length (23), dimension (12) and number of
- * redundant bits (11), the binary (23,12,7) Golay code can be encoded and
- * decoded simply by using look-up tables. The program below uses a 16K
- * encoding table and an 8K decoding table.
- *
- * For more information, suggestions, or other ideas on implementing error
- * correcting codes, please contact me at (I'm temporarily in Japan, but
- * below is my U.S. address):
- *
- *                    Robert Morelos-Zaragoza
- *                    770 S. Post Oak Ln. #200
- *                      Houston, Texas 77056
- *
- *             email: robert@spectra.eng.hawaii.edu
- *
- *       Homework: Add an overall parity-check bit to get the (24,12,8)
- *                 extended Golay code.
- *
- * COPYRIGHT NOTICE: This computer program is free for non-commercial purposes.
- * You may implement this program for any non-commercial application. You may
- * also implement this program for commercial purposes, provided that you
- * obtain my written permission. Any modification of this program is covered
- * by this copyright.
- *
- * ==   Copyright (c) 1994  Robert Morelos-Zaragoza. All rights reserved.   ==
- */
-
-#include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
-#define X22             0x00400000   /* vector representation of X^{22} */
-#define X11             0x00000800   /* vector representation of X^{11} */
-#define MASK12          0xfffff800   /* auxiliary vector for testing */
-#define GENPOL          0x00000c75   /* generator polinomial, g(x) */
-
-/* Global variables:
- *
- * pattern = error pattern, or information, or received vector
- * encoding_table[] = encoding table
- * decoding_table[] = decoding table
- * data = information bits, i(x)
- * codeword = code bits = x^{11}i(x) + (x^{11}i(x) mod g(x))
- * numerr = number of errors = Hamming weight of error polynomial e(x)
- * position[] = error positions in the vector representation of e(x)
- * recd = representation of corrupted received polynomial r(x) = c(x) + e(x)
- * decerror = number of decoding errors
- * a[] = auxiliary array to generate correctable error patterns
- */
-
-int32_t get_syndrome(int32_t pattern)
-/*
- * Compute the syndrome corresponding to the given pattern, i.e., the
- * remainder after dividing the pattern (when considering it as the vector
- * representation of a polynomial) by the generator polynomial, GENPOL.
- * In the program this pattern has several meanings: (1) pattern = infomation
- * bits, when constructing the encoding table; (2) pattern = error pattern,
- * when constructing the decoding table; and (3) pattern = received vector, to
- * obtain its syndrome in decoding.
- */
-{
-    int32_t aux = X22;
-
-    if (pattern >= X11)
-       while (pattern & MASK12) {
-           while (!(aux & pattern))
-              aux = aux >> 1;
-           pattern ^= (aux/X11) * GENPOL;
-           }
-    return(pattern);
 }

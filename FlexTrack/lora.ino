@@ -144,7 +144,7 @@ void SetupLoRa(void)
   setupFSK();
 }
 
-void setupRFM98(double Frequency, int Mode)
+void setupRFM98(float Frequency, int Mode)
 {
   int ErrorCoding;
   int Bandwidth;
@@ -229,14 +229,15 @@ void setupRFM98(double Frequency, int Mode)
   Serial.println("Setup Complete");
 }
 
-void setFrequency(double Frequency)
+// expect tx worse than  1 ppm, so float is good enough
+void setFrequency(float Frequency)
 {
   unsigned long FrequencyValue;
     
   Serial.print("Frequency is ");
   Serial.println(Frequency);
 
-  Frequency = Frequency * 7110656 / 434;
+  Frequency = Frequency * 16384.0f;
   FrequencyValue = (unsigned long)(Frequency);
 
   Serial.print("FrequencyValue is ");
@@ -429,6 +430,7 @@ int BuildLoRaPositionPacket(unsigned char *TxLine)
   return sizeof(struct TBinaryPacket);
 }
 
+uint8_t FrequencyLSB = 0; // saved value for bitbanging FSK
 void SwitchToFSKMode(void)
 {
   unsigned long FrequencyValue;
@@ -450,11 +452,14 @@ void SwitchToFSKMode(void)
   writeRegister(REG_PA_CONFIG, POWERLEVEL);
     
   // Frequency
-  FrequencyValue = (unsigned long)((LORA_FSK_FREQ + (LORA_OFFSET / 1000.0)) * 7110656 / 434);
+  FrequencyValue = (unsigned long)((LORA_FSK_FREQ + (LORA_OFFSET / 1000.0)) * 16384.0f);
   writeRegister(REG_FRF_MSB, (FrequencyValue >> 16) & 0xFF);   // Set frequency
   writeRegister(REG_FRF_MID, (FrequencyValue >> 8) & 0xFF);
   writeRegister(REG_FRF_LSB, FrequencyValue & 0xFF);
-  
+
+  // Save frequency for bit banging carrier
+  FrequencyLSB = 0xf0 & FrequencyValue;
+ 
   // Modem config
   writeRegister(REG_PLL_HOP, 0x80 + 0x2d);	// default value + fasthop
   writeRegister(REG_PACKET_CONFIG1, 0x80);	// variable length, no DC fix, no CRC, no addressing
@@ -462,10 +467,11 @@ void SwitchToFSKMode(void)
 //writeRegister(REG_PAYLOAD_LENGTH_FSK, 0);
 }
 
-void LoraFSKshift(byte shift) {
-  byte FrequencyLSB = 0xf0 & (unsigned long)((LORA_FSK_FREQ + (LORA_OFFSET / 1000.0)) * 7110656 / 434);
-  byte offset = (shift * LORA_FSK_SHIFT) & 0x0f;
+// called from inside an interrupt: use pre-calculated frequency
+inline void LoraFSKshift(int8_t shift) {
+  int8_t offset;
 
+  offset = (shift * LORA_FSK_SHIFT) & 0x0f;
   writeRegister(REG_FRF_LSB, FrequencyLSB + offset); // fast hop carrier shift
 }
 

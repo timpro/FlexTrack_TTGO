@@ -13,29 +13,32 @@ s|                                                                              
 |                                                                                                        |
 \*------------------------------------------------------------------------------------------------------*/
 
+// Code for 4fsk is taken from GPL2 sources. Flextrak License is GPL3.
+
 //------------------------------------------------------------------------------------------------------
 
 // CONFIGURATION SECTION.
-
-// Power settings
-#define POWERSAVING	                      // Comment out to disable GPS power saving
+//#define FAKEGPS
+#define POWERSAVING	                // Comment out to disable GPS power saving
 
 // LORA settings
-#define LORA_PAYLOAD_ID   "TTGO"            // Do not use spaces.
-#define LORA_FREQUENCY      869.5
-#define LORA_OFFSET           0         // Frequency to add in kHz to make Tx frequency accurate
+#define LORA_PAYLOAD_ID   "TTGO"	// Do not use spaces.
 
-#define POWERLEVEL	(0x80 - 2 + 7)  //  7dBm =  5mW for 868MHz
-//#define POWERLEVEL	(0x80 - 2 + 10) // 10dBm = 10mW for 434MHz
+#define LORA_FREQUENCY     869.5
+#define LORA_OFFSET          0		// Frequency to add in kHz to make Tx frequency accurate
 
 #define LORA_ID              0
 #define LORA_MODE            2
 #define LORA_BINARY          0
 
-#define HORUS_4FSK_ID         0	        // Request a personal ID from Project Horus
-#define LORA_FSK_FREQ       869.5
-#define LORA_FSK_SHIFT        3
+#define HORUS_4FSK_ID        0		// Request a personal ID from Project Horus
+#define LORA_FSK_FREQ      869.5
+#define LORA_FSK_SHIFT       3		// 60 Hz steps, maximum is 5
 
+//#define POWERLEVEL	(0x81)		//  3dBm =  2mW for QRP
+#define POWERLEVEL	(0x80 - 2 + 7)  //  7dBm =  5mW for 868MHz
+//#define POWERLEVEL	(0x80 - 2 + 10) // 10dBm = 10mW for 434MHz
+//#define POWERLEVEL	(0x80 - 2 + 13) // 13dBm = 20mW (where permitted)
 
 // Cutdown settings
 // #define CUTDOWN             A2
