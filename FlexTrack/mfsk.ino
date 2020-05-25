@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "H128_384.h"
+#include "HRA128_384.h"
 
 void LoraFSKshift(int8_t shift); // bitbang carrier frequency
 void interleave(unsigned char *inout, int nbytes);
@@ -25,7 +25,7 @@ int packet_length = 0;
 
 /* Short binary packet */
 // 4 byte preamble for high error rates ("ESC,ESC,$,$")
-// All data 8 bit Gray coded when calculating Checksum
+// All data 8 bit Gray coded before calculating Checksum
 //	- to improve soft bit prediction
 struct __attribute__ ((packed)) FBinaryPacket 
 {
@@ -182,7 +182,7 @@ hw_timer_t * timer = NULL;
 void initTimer() {
 	timer = timerBegin(0, 8000, true); // 80Mhz to 10 kHz
 	timerAttachInterrupt(timer, &TIM2_IRQHandler, true);
-	timerAlarmWrite(timer, 100, true); // 10 kHz to 100 Hz
+	timerAlarmWrite(timer, 400, true); // 10 kHz to 25 Hz
 	timerAlarmEnable(timer);
 }
 
@@ -265,33 +265,36 @@ void send_mfsk_packet() {
 int ldpc_encode_tx_packet(unsigned char *out_data, unsigned char *in_data) {
     unsigned int   i, last = 0;
     unsigned char *pout;
-    const char uw[] = { 0x1b, 0x1b,'$','$' };
+    const char uw_v2[] = { 0x96, 0x69, 0x69, 0x96 };
 
     pout = out_data;
-    memcpy(pout, uw, sizeof(uw));
-    pout += sizeof(uw);
-    memcpy(pout, in_data, DATABYTES);
-    pout += DATABYTES;
-    memset(pout, 0, PARITYBYTES);
+    memcpy(pout, uw_v2, sizeof(uw_v2));
+    pout += sizeof(uw_v2);
+    memcpy(pout, in_data, DATA_BYTES);
+    pout += DATA_BYTES;
+    memset(pout, 0, PARITY_BYTES);
 
     // process parity bit offsets
     for (i = 0; i < NUMBERPARITYBITS; i++) {
         unsigned int shift, j;
 
-	for(j = 0; j < ROWDEPTH; j++) {
-		uint8_t tmp  = H_rows[i + j * NUMBERPARITYBITS] - 1;
-		shift = 7 - (tmp & 7); // MSB
-		last ^= in_data[tmp >> 3] >> shift;
+	for(j = 0; j < MAX_ROW_WEIGHT; j++) {
+		uint8_t tmp  = H_rows[i + j * NUMBERPARITYBITS];
+		if (tmp) {
+			tmp--;
+			shift = 7 - (tmp & 7); // MSB
+			last ^= in_data[tmp >> 3] >> shift;
+		}
 	}
 	shift = 7 - (i & 7); // MSB
 	pout[i >> 3] |= (last & 1) << shift;
     }
 
-    pout = out_data + sizeof(uw);
-    interleave(pout, CODEBYTES);
-    scramble(pout, CODEBYTES);
+    pout = out_data + sizeof(uw_v2);
+    interleave(pout, DATA_BYTES + PARITY_BYTES);
+    scramble(pout, DATA_BYTES + PARITY_BYTES);
 
-    return CODEBYTES + sizeof(uw);
+    return DATA_BYTES + PARITY_BYTES + sizeof(uw_v2);
 }
 
 // single directional for encoding
