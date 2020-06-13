@@ -218,10 +218,30 @@ void ProcessNMEA(char *Buffer, int Count)
   }
 }
 
-  
 void CheckGPS(void)
 {
-{
+#ifdef FAKEGPS
+// no GPS or testing: generate some data
+	float position;
+	uint32_t minutes, faketime;
+
+	faketime = millis() / 1000;
+	if (faketime == GPS.SecondsInDay)
+		return;
+	GPS.SecondsInDay = faketime;
+	GPS.Seconds = faketime % 60;
+	minutes = faketime / 60;
+	GPS.Minutes = minutes % 60;
+	GPS.Hours = minutes / 60;
+
+	position = 51.0f + 0.5f * cosf((float)faketime/2000.0f);
+	GPS.Latitude = position;
+	position = 0.1f - 0.5f * sinf((float)faketime/3000.0f);
+	GPS.Longitude = position;
+	position = 500.0f +  200.0f * sinf((float)faketime/300.0f);
+	GPS.Altitude = (uint16_t)position;
+	GPS.Satellites = (uint8_t)(position * 0.015f);
+#else
   static unsigned long ModeTime=0;
   static char Line[128];
   static int Length=0;
@@ -251,16 +271,18 @@ void CheckGPS(void)
       }
     }
   }
-
+#endif
+#ifdef FLIGHTMODE
   if (millis() >= ModeTime)
   {
     RequiredFlightMode = (GPS.Altitude > 1000) ? 6 : 3;    // 6 is airborne <1g mode; 3=Pedestrian mode
     if (RequiredFlightMode != GPS.FlightMode)
     {
-      // SetFlightMode(RequiredFlightMode);
-      // Serial.println("Setting flight mode\n");
+      SetFlightMode(RequiredFlightMode);
+      Serial.println("Setting flight mode\n");
     }
     
     ModeTime = millis() + 60000;
   }
-}}
+#endif
+}

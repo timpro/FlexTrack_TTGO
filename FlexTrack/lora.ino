@@ -35,8 +35,8 @@
 #define REG_MODEM_CONFIG            0x1D
 #define REG_MODEM_CONFIG2           0x1E
 #define REG_MODEM_CONFIG3           0x26
-#define REG_PREAMBLE_MSB            0x20
-#define REG_PREAMBLE_LSB            0x21
+//#define REG_PREAMBLE_MSB          0x18
+//#define REG_PREAMBLE_LSB          0x19
 #define REG_PAYLOAD_LENGTH          0x22
 #define REG_HOP_PERIOD              0x24
 #define REG_FREQ_ERROR              0x28
@@ -48,8 +48,10 @@
 #define REG_DIO_MAPPING_2           0x41
 
 // FSK stuff
-#define REG_PREAMBLE_MSB_FSK        0x25
-#define REG_PREAMBLE_LSB_FSK        0x26
+#define REG_PA_RAMP                 0x0A
+#define REG_PREAMBLE_FSK            0x26
+#define REG_SYNC_CONF               0x27
+#define REG_SYNC1                   0x28
 #define REG_PACKET_CONFIG1          0x30
 #define REG_PACKET_CONFIG2          0x31
 #define REG_PAYLOAD_LENGTH_FSK      0x32
@@ -138,13 +140,17 @@ int FSKCount=0;
 int InFSKMode=0;
 int SendingFSK=0;
 
+void writeRegister(byte addr, byte value);
+void select();
+void unselect();
+
 void SetupLoRa(void)
 {
   setupRFM98(LORA_FREQUENCY, LORA_MODE);
-  setupFSK();
+  // setupFSK();
 }
 
-void setupRFM98(double Frequency, int Mode)
+void setupRFM98(float Frequency, int Mode)
 {
   int ErrorCoding;
   int Bandwidth;
@@ -229,14 +235,15 @@ void setupRFM98(double Frequency, int Mode)
   Serial.println("Setup Complete");
 }
 
-void setFrequency(double Frequency)
+// expect tx worse than  1 ppm, so float is good enough
+void setFrequency(float Frequency)
 {
   unsigned long FrequencyValue;
     
   Serial.print("Frequency is ");
   Serial.println(Frequency);
 
-  Frequency = Frequency * 7110656 / 434;
+  Frequency = Frequency * 16384.0f;
   FrequencyValue = (unsigned long)(Frequency);
 
   Serial.print("FrequencyValue is ");
@@ -340,9 +347,15 @@ void unselect()
   digitalWrite(LORA_NSS, HIGH);
 }
 
+int FSKPacketSent(void)
+{
+  return ((readRegister(REG_IRQ_FLAGS2) & 0x48) != 0);
+}
+
+
 int LoRaIsFree(void)
 {
-  if (SendingFSK && checkFSK()) {
+  if (SendingFSK && FSKPacketSent()) {
     SendingFSK = 0;
     LoRaMode = lmIdle;
   }
@@ -369,7 +382,7 @@ int lora_read_temperature() {
   // Read ADC Value. Internal Temp (degC) = 15 - ADC Value
   temp = readRegister(REG_TEMP);
 
-  return 15 - (int)(temp);
+  return 15 - (signed char)(temp);
 }
 
 void SendLoRaPacket(unsigned char *buffer, int Length)
@@ -379,9 +392,6 @@ void SendLoRaPacket(unsigned char *buffer, int Length)
   LastLoRaTX = millis();
 
   Serial.print("Sending "); Serial.print(Length);Serial.println(" bytes");
-
-  // read temperature while chip is awake
-  GPS.InternalTemperature = lora_read_temperature();
 
   setLoRaMode();
   setMode(RF98_MODE_STANDBY);
@@ -408,6 +418,9 @@ void SendLoRaPacket(unsigned char *buffer, int Length)
   setMode(RF98_MODE_TX);
   LoRaMode = lmSending;
   InFSKMode = 0;
+
+  // read temperature while chip is awake
+  GPS.InternalTemperature = lora_read_temperature();
 }
 
 
@@ -432,41 +445,42 @@ int BuildLoRaPositionPacket(unsigned char *TxLine)
 void SwitchToFSKMode(void)
 {
   unsigned long FrequencyValue;
-  uint8_t mode = readRegister(REG_OPMODE);
 
-  // read temperature while chip is awake
-  GPS.InternalTemperature = lora_read_temperature();
+  Serial.println("Setting FSK Mode");
+  setMode(RF98_MODE_SLEEP);
+  writeRegister(REG_OPMODE, 0x0);
 
   InFSKMode = 1;
-  if (mode & (1<<7))  //if in lora mode
-    writeRegister(REG_OPMODE,(mode & ~(uint8_t)7));    //set to sleep mode so fsk bit can be written
-  else
-    writeRegister(REG_OPMODE,(mode & ~(uint8_t)7) | 1);  //set to standby mode so various settings can be written  
-
-  mode = readRegister(REG_OPMODE);
-  writeRegister(REG_OPMODE, mode & ~(uint8_t)(7<<5));         //set to FSK
+  setMode(RF98_MODE_STANDBY);
 
   writeRegister(REG_LNA, LNA_OFF_GAIN);  // TURN LNA OFF FOR TRANSMIT
   writeRegister(REG_PA_CONFIG, POWERLEVEL);
-    
+  writeRegister(REG_PA_RAMP, 0x2A); // GFSK
+
   // Frequency
-  FrequencyValue = (unsigned long)((LORA_FSK_FREQ + (LORA_OFFSET / 1000.0)) * 7110656 / 434);
+  FrequencyValue = (unsigned long)((LORA_FSK_FREQ + (LORA_OFFSET / 1000.0)) * 16384.0f);
   writeRegister(REG_FRF_MSB, (FrequencyValue >> 16) & 0xFF);   // Set frequency
   writeRegister(REG_FRF_MID, (FrequencyValue >> 8) & 0xFF);
   writeRegister(REG_FRF_LSB, FrequencyValue & 0xFF);
-  
+
   // Modem config
-  writeRegister(REG_PLL_HOP, 0x80 + 0x2d);	// default value + fasthop
-  writeRegister(REG_PACKET_CONFIG1, 0x80);	// variable length, no DC fix, no CRC, no addressing
-  writeRegister(REG_PACKET_CONFIG2, 0x00);	// continuous mode
-//writeRegister(REG_PAYLOAD_LENGTH_FSK, 0);
-}
-
-void LoraFSKshift(byte shift) {
-  byte FrequencyLSB = 0xf0 & (unsigned long)((LORA_FSK_FREQ + (LORA_OFFSET / 1000.0)) * 7110656 / 434);
-  byte offset = (shift * LORA_FSK_SHIFT) & 0x0f;
-
-  writeRegister(REG_FRF_LSB, FrequencyLSB + offset); // fast hop carrier shift
+  writeRegister(REG_PLL_HOP,	 0x80 + 0x2d);	// default value + fasthop
+  writeRegister(REG_PACKET_CONFIG1,	0x10);	// fixed length, no whitening, CRC on, no addressing
+  writeRegister(REG_PACKET_CONFIG2,	0x40);	// packet mode
+  writeRegister(REG_BITRATE_MSB,	0xFA);	// 32MHz / 256 * 250  => 500 Hz
+  writeRegister(REG_BITRATE_LSB,	0x00);	// - no finer adjustment needed
+  writeRegister(REG_FDEV_LSB,		0x07);	// 7 * 120 Hz => 840 Hz
+  writeRegister(REG_PREAMBLE_FSK,	0x0F);	// - rfm preamble is odd
+  writeRegister(REG_PAYLOAD_LENGTH_FSK,   48);	// 16 data + 32 FEC
+  writeRegister(REG_SYNC_CONF,		0x17);	// 8 sync (4 are preamble)
+  writeRegister(REG_SYNC1,		0x55);  // preamble
+  writeRegister(REG_SYNC1 + 1,		0x55);  // preamble
+  writeRegister(REG_SYNC1 + 2,		0x55);  // preamble
+  writeRegister(REG_SYNC1 + 3,		0x55);  // preamble
+  writeRegister(REG_SYNC1 + 4,		0x96);	// horus sync
+  writeRegister(REG_SYNC1 + 5,		0x69);	// horus sync
+  writeRegister(REG_SYNC1 + 6,		0x69);	// horus sync
+  writeRegister(REG_SYNC1 + 7,		0x96);	// horus sync
 }
 
 void SendLoRaFSK()
@@ -474,12 +488,15 @@ void SendLoRaFSK()
   if ( !InFSKMode )
     SwitchToFSKMode();
 
-  writeRegister(REG_OPMODE, 0x0B);   // Tx mode
-  
+  setMode(RF98_MODE_TX);
+
   // Set channel state
   LoRaMode = lmSending;
-  SendingFSK = 5; // flag / fake delay for testing
+  SendingFSK = 1;
   send_mfsk_packet();
+
+  // read temperature while chip is awake
+  GPS.InternalTemperature = lora_read_temperature();
 }
 
 void CheckLoRa(void)
